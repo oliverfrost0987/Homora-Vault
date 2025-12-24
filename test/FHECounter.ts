@@ -1,104 +1,118 @@
 import { HardhatEthersSigner } from "@nomicfoundation/hardhat-ethers/signers";
-import { ethers, fhevm } from "hardhat";
-import { FHECounter, FHECounter__factory } from "../types";
 import { expect } from "chai";
 import { FhevmType } from "@fhevm/hardhat-plugin";
+import { ethers, fhevm } from "hardhat";
+import { HomoraToken, HomoraToken__factory, HomoraVault, HomoraVault__factory } from "../types";
 
 type Signers = {
   deployer: HardhatEthersSigner;
   alice: HardhatEthersSigner;
-  bob: HardhatEthersSigner;
 };
 
-async function deployFixture() {
-  const factory = (await ethers.getContractFactory("FHECounter")) as FHECounter__factory;
-  const fheCounterContract = (await factory.deploy()) as FHECounter;
-  const fheCounterContractAddress = await fheCounterContract.getAddress();
+const CLAIM_AMOUNT = 1_000_000_000n;
 
-  return { fheCounterContract, fheCounterContractAddress };
+async function deployFixture() {
+  const tokenFactory = (await ethers.getContractFactory("HomoraToken")) as HomoraToken__factory;
+  const token = (await tokenFactory.deploy()) as HomoraToken;
+  const tokenAddress = await token.getAddress();
+
+  const vaultFactory = (await ethers.getContractFactory("HomoraVault")) as HomoraVault__factory;
+  const vault = (await vaultFactory.deploy(tokenAddress)) as HomoraVault;
+  const vaultAddress = await vault.getAddress();
+
+  return { token, tokenAddress, vault, vaultAddress };
 }
 
-describe("FHECounter", function () {
+describe("HomoraVault", function () {
   let signers: Signers;
-  let fheCounterContract: FHECounter;
-  let fheCounterContractAddress: string;
+  let token: HomoraToken;
+  let tokenAddress: string;
+  let vault: HomoraVault;
+  let vaultAddress: string;
 
   before(async function () {
     const ethSigners: HardhatEthersSigner[] = await ethers.getSigners();
-    signers = { deployer: ethSigners[0], alice: ethSigners[1], bob: ethSigners[2] };
+    signers = { deployer: ethSigners[0], alice: ethSigners[1] };
   });
 
   beforeEach(async function () {
-    // Check whether the tests are running against an FHEVM mock environment
     if (!fhevm.isMock) {
       console.warn(`This hardhat test suite cannot run on Sepolia Testnet`);
       this.skip();
     }
 
-    ({ fheCounterContract, fheCounterContractAddress } = await deployFixture());
+    ({ token, tokenAddress, vault, vaultAddress } = await deployFixture());
   });
 
-  it("encrypted count should be uninitialized after deployment", async function () {
-    const encryptedCount = await fheCounterContract.getCount();
-    // Expect initial count to be bytes32(0) after deployment,
-    // (meaning the encrypted count value is uninitialized)
-    expect(encryptedCount).to.eq(ethers.ZeroHash);
-  });
+  it("claims, stakes, and withdraws with encrypted amounts", async function () {
+    await token.connect(signers.alice).claim();
 
-  it("increment the counter by 1", async function () {
-    const encryptedCountBeforeInc = await fheCounterContract.getCount();
-    expect(encryptedCountBeforeInc).to.eq(ethers.ZeroHash);
-    const clearCountBeforeInc = 0;
+    await expect(token.connect(signers.alice).claim())
+      .to.be.revertedWithCustomError(token, "AlreadyClaimed")
+      .withArgs(signers.alice.address);
 
-    // Encrypt constant 1 as a euint32
-    const clearOne = 1;
-    const encryptedOne = await fhevm
-      .createEncryptedInput(fheCounterContractAddress, signers.alice.address)
-      .add32(clearOne)
-      .encrypt();
-
-    const tx = await fheCounterContract
-      .connect(signers.alice)
-      .increment(encryptedOne.handles[0], encryptedOne.inputProof);
-    await tx.wait();
-
-    const encryptedCountAfterInc = await fheCounterContract.getCount();
-    const clearCountAfterInc = await fhevm.userDecryptEuint(
-      FhevmType.euint32,
-      encryptedCountAfterInc,
-      fheCounterContractAddress,
+    const encryptedBalance = await token.confidentialBalanceOf(signers.alice.address);
+    const clearBalance = await fhevm.userDecryptEuint(
+      FhevmType.euint64,
+      encryptedBalance,
+      tokenAddress,
       signers.alice,
     );
+    expect(clearBalance).to.eq(CLAIM_AMOUNT);
 
-    expect(clearCountAfterInc).to.eq(clearCountBeforeInc + clearOne);
-  });
+    const latestBlock = await ethers.provider.getBlock("latest");
+    const until = (latestBlock?.timestamp ?? 0) + 24 * 60 * 60;
+    await token.connect(signers.alice).setOperator(vaultAddress, until);
 
-  it("decrement the counter by 1", async function () {
-    // Encrypt constant 1 as a euint32
-    const clearOne = 1;
-    const encryptedOne = await fhevm
-      .createEncryptedInput(fheCounterContractAddress, signers.alice.address)
-      .add32(clearOne)
+    const stakeAmount = 400_000_000n;
+    const encryptedInput = await fhevm
+      .createEncryptedInput(tokenAddress, signers.alice.address)
+      .add64(stakeAmount)
       .encrypt();
 
-    // First increment by 1, count becomes 1
-    let tx = await fheCounterContract
+    const lockDuration = 3600;
+    const stakeTx = await vault
       .connect(signers.alice)
-      .increment(encryptedOne.handles[0], encryptedOne.inputProof);
-    await tx.wait();
+      .stake(encryptedInput.handles[0], encryptedInput.inputProof, lockDuration);
+    await stakeTx.wait();
 
-    // Then decrement by 1, count goes back to 0
-    tx = await fheCounterContract.connect(signers.alice).decrement(encryptedOne.handles[0], encryptedOne.inputProof);
-    await tx.wait();
+    const stakeData = await vault.getStake(signers.alice.address);
+    expect(stakeData[2]).to.eq(true);
 
-    const encryptedCountAfterDec = await fheCounterContract.getCount();
-    const clearCountAfterInc = await fhevm.userDecryptEuint(
-      FhevmType.euint32,
-      encryptedCountAfterDec,
-      fheCounterContractAddress,
+    const decryptedStake = await fhevm.userDecryptEuint(
+      FhevmType.euint64,
+      stakeData[0],
+      vaultAddress,
       signers.alice,
     );
+    expect(decryptedStake).to.eq(stakeAmount);
 
-    expect(clearCountAfterInc).to.eq(0);
+    const encryptedBalanceAfterStake = await token.confidentialBalanceOf(signers.alice.address);
+    const clearBalanceAfterStake = await fhevm.userDecryptEuint(
+      FhevmType.euint64,
+      encryptedBalanceAfterStake,
+      tokenAddress,
+      signers.alice,
+    );
+    expect(clearBalanceAfterStake).to.eq(CLAIM_AMOUNT - stakeAmount);
+
+    await expect(vault.connect(signers.alice).withdraw()).to.be.revertedWithCustomError(vault, "StakeLocked");
+
+    await ethers.provider.send("evm_increaseTime", [lockDuration]);
+    await ethers.provider.send("evm_mine", []);
+
+    await vault.connect(signers.alice).withdraw();
+
+    const finalStake = await vault.getStake(signers.alice.address);
+    expect(finalStake[2]).to.eq(false);
+
+    const encryptedBalanceAfterWithdraw = await token.confidentialBalanceOf(signers.alice.address);
+    const clearBalanceAfterWithdraw = await fhevm.userDecryptEuint(
+      FhevmType.euint64,
+      encryptedBalanceAfterWithdraw,
+      tokenAddress,
+      signers.alice,
+    );
+    expect(clearBalanceAfterWithdraw).to.eq(CLAIM_AMOUNT);
   });
 });
