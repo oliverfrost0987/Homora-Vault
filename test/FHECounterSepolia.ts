@@ -1,23 +1,19 @@
 import { HardhatEthersSigner } from "@nomicfoundation/hardhat-ethers/signers";
-import { ethers, fhevm, deployments } from "hardhat";
-import { FHECounter } from "../types";
 import { expect } from "chai";
 import { FhevmType } from "@fhevm/hardhat-plugin";
+import { deployments, ethers, fhevm } from "hardhat";
+import { HomoraToken, HomoraVault } from "../types";
 
 type Signers = {
   alice: HardhatEthersSigner;
 };
 
-describe("FHECounterSepolia", function () {
+describe("HomoraVaultSepolia", function () {
   let signers: Signers;
-  let fheCounterContract: FHECounter;
-  let fheCounterContractAddress: string;
-  let step: number;
-  let steps: number;
-
-  function progress(message: string) {
-    console.log(`${++step}/${steps} ${message}`);
-  }
+  let token: HomoraToken;
+  let vault: HomoraVault;
+  let tokenAddress: string;
+  let vaultAddress: string;
 
   before(async function () {
     if (fhevm.isMock) {
@@ -26,9 +22,12 @@ describe("FHECounterSepolia", function () {
     }
 
     try {
-      const FHECounterDeployement = await deployments.get("FHECounter");
-      fheCounterContractAddress = FHECounterDeployement.address;
-      fheCounterContract = await ethers.getContractAt("FHECounter", FHECounterDeployement.address);
+      const tokenDeployment = await deployments.get("HomoraToken");
+      const vaultDeployment = await deployments.get("HomoraVault");
+      tokenAddress = tokenDeployment.address;
+      vaultAddress = vaultDeployment.address;
+      token = await ethers.getContractAt("HomoraToken", tokenDeployment.address);
+      vault = await ethers.getContractAt("HomoraVault", vaultDeployment.address);
     } catch (e) {
       (e as Error).message += ". Call 'npx hardhat deploy --network sepolia'";
       throw e;
@@ -38,67 +37,52 @@ describe("FHECounterSepolia", function () {
     signers = { alice: ethSigners[0] };
   });
 
-  beforeEach(async () => {
-    step = 0;
-    steps = 0;
-  });
+  it("claims and stakes on Sepolia", async function () {
+    this.timeout(4 * 60000);
 
-  it("increment the counter by 1", async function () {
-    steps = 10;
+    const claimed = await token.hasClaimed(signers.alice.address);
+    if (!claimed) {
+      const claimTx = await token.connect(signers.alice).claim();
+      await claimTx.wait();
+    }
 
-    this.timeout(4 * 40000);
-
-    progress("Encrypting '0'...");
-    const encryptedZero = await fhevm
-      .createEncryptedInput(fheCounterContractAddress, signers.alice.address)
-      .add32(0)
-      .encrypt();
-
-    progress(
-      `Call increment(0) FHECounter=${fheCounterContractAddress} handle=${ethers.hexlify(encryptedZero.handles[0])} signer=${signers.alice.address}...`,
-    );
-    let tx = await fheCounterContract
-      .connect(signers.alice)
-      .increment(encryptedZero.handles[0], encryptedZero.inputProof);
-    await tx.wait();
-
-    progress(`Call FHECounter.getCount()...`);
-    const encryptedCountBeforeInc = await fheCounterContract.getCount();
-    expect(encryptedCountBeforeInc).to.not.eq(ethers.ZeroHash);
-
-    progress(`Decrypting FHECounter.getCount()=${encryptedCountBeforeInc}...`);
-    const clearCountBeforeInc = await fhevm.userDecryptEuint(
-      FhevmType.euint32,
-      encryptedCountBeforeInc,
-      fheCounterContractAddress,
+    const encryptedBalance = await token.confidentialBalanceOf(signers.alice.address);
+    const clearBalance = await fhevm.userDecryptEuint(
+      FhevmType.euint64,
+      encryptedBalance,
+      tokenAddress,
       signers.alice,
     );
-    progress(`Clear FHECounter.getCount()=${clearCountBeforeInc}`);
+    expect(clearBalance).to.be.greaterThan(0n);
 
-    progress(`Encrypting '1'...`);
-    const encryptedOne = await fhevm
-      .createEncryptedInput(fheCounterContractAddress, signers.alice.address)
-      .add32(1)
-      .encrypt();
+    const stakeData = await vault.getStake(signers.alice.address);
+    if (!stakeData[2]) {
+      const latestBlock = await ethers.provider.getBlock("latest");
+      const until = (latestBlock?.timestamp ?? 0) + 24 * 60 * 60;
+      const setOpTx = await token.connect(signers.alice).setOperator(vaultAddress, until);
+      await setOpTx.wait();
 
-    progress(
-      `Call increment(1) FHECounter=${fheCounterContractAddress} handle=${ethers.hexlify(encryptedOne.handles[0])} signer=${signers.alice.address}...`,
-    );
-    tx = await fheCounterContract.connect(signers.alice).increment(encryptedOne.handles[0], encryptedOne.inputProof);
-    await tx.wait();
+      const stakeAmount = 100_000_000n;
+      const encryptedInput = await fhevm
+        .createEncryptedInput(tokenAddress, signers.alice.address)
+        .add64(stakeAmount)
+        .encrypt();
 
-    progress(`Call FHECounter.getCount()...`);
-    const encryptedCountAfterInc = await fheCounterContract.getCount();
+      const stakeTx = await vault
+        .connect(signers.alice)
+        .stake(encryptedInput.handles[0], encryptedInput.inputProof, 120);
+      await stakeTx.wait();
+    }
 
-    progress(`Decrypting FHECounter.getCount()=${encryptedCountAfterInc}...`);
-    const clearCountAfterInc = await fhevm.userDecryptEuint(
-      FhevmType.euint32,
-      encryptedCountAfterInc,
-      fheCounterContractAddress,
-      signers.alice,
-    );
-    progress(`Clear FHECounter.getCount()=${clearCountAfterInc}`);
-
-    expect(clearCountAfterInc - clearCountBeforeInc).to.eq(1);
+    const updatedStake = await vault.getStake(signers.alice.address);
+    if (updatedStake[2]) {
+      const decryptedStake = await fhevm.userDecryptEuint(
+        FhevmType.euint64,
+        updatedStake[0],
+        vaultAddress,
+        signers.alice,
+      );
+      expect(decryptedStake).to.be.greaterThan(0n);
+    }
   });
 });
